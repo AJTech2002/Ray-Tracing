@@ -1,0 +1,300 @@
+﻿// Each #kernel tells which function to compile; you can have many kernels
+#pragma kernel CSMain
+
+
+float4x4 _CameraToWorld;
+float4x4 _CameraInverseProjection;
+static const float PI = 3.14159265f;
+Texture2D<float4> _SkyboxTexture;
+SamplerState sampler_SkyboxTexture;
+float3 CameraPos;
+
+struct SphereDat {
+	float3 pos;
+	float3 col;
+	//Radius, Shininess, -
+	float3 details;
+};
+
+struct Ray {
+	float3 origin;
+	float3 direction;
+	float3 energy;
+};
+
+struct RayHit {
+	float3 position;
+	float distance;
+	
+	//For sphere it's simply the direction at which the ray hit it
+	float3 normal;
+};
+//s
+
+Ray CreateRay(float3 origin, float3 direction)
+{
+	Ray ray;
+	ray.origin = origin;
+	ray.direction = direction;
+	ray.energy = float3(1, 1, 1);
+	return ray;
+}
+
+Ray CreateCameraRay(float2 uv)
+{
+	// Transform the camera origin to world space
+	float3 origin = CameraPos;
+
+	// Invert the perspective projection of the view-space position
+	float3 direction = mul(_CameraInverseProjection, float4(uv, 0.0f, 1.0f)).xyz;
+	// Transform the direction from camera to world space and normalize
+	direction = mul(_CameraToWorld, float4(direction, 0.0f)).xyz;
+	direction = normalize(direction);
+
+	return CreateRay(origin, direction);
+}
+
+
+
+RayHit CreateRayHit()
+{
+	RayHit hit;
+	hit.position = float3(0.0f, 0.0f, 0.0f);
+	hit.distance = 1.#INF;
+	
+	hit.normal = float3(0.0f, 0.0f, 0.0f);
+	return hit;
+}
+
+void IntersectGroundPlane(Ray ray, inout RayHit bestHit)
+{
+	// Calculate distance along the ray where the ground plane is intersected
+	float t = -ray.origin.y / ray.direction.y;
+	if (t > 0 && t < bestHit.distance)
+	{
+		bestHit.distance = t;
+		bestHit.position = ray.origin + t * ray.direction;
+		bestHit.normal = float3(0.0f, 1.0f, 0.0f);
+	}
+}
+
+void IntersectSphere(Ray ray, inout RayHit bestHit, float4 sphere)
+{
+	// Calculate distance along the ray where the sphere is intersected
+	float3 d = ray.origin - sphere.xyz;
+	float p1 = -dot(ray.direction, d);
+	float p2sqr = p1 * p1 - dot(d, d) + sphere.w * sphere.w;
+	if (p2sqr < 0)
+		return;
+	float p2 = sqrt(p2sqr);
+	float t = p1 - p2 > 0 ? p1 - p2 : p1 + p2;
+	if (t > 0 && t < bestHit.distance)
+	{
+		bestHit.distance = t;
+		bestHit.position = ray.origin + t * ray.direction;
+		bestHit.normal = normalize(bestHit.position - sphere.xyz);
+	}
+}
+
+
+
+// Create a RenderTexture with enableRandomWrite flag and set it
+// with cs.SetTexture
+RWTexture2D<float4> Result;
+RWStructuredBuffer<SphereDat> SphereData;
+float Height;
+float Width;
+
+
+
+
+
+float3 ClosestReflectiveTrace(inout Ray ray, RayHit hit)
+{
+	
+	uint v;
+	uint bestTemporaryHitIndex;
+
+	uint count;
+	uint stride;
+	SphereData.GetDimensions(count, stride);
+
+	RayHit bestTemporaryHit;
+
+	for (v = 0; v < count; v++)
+	{
+
+		IntersectSphere(ray, hit, float4(SphereData[v].pos, SphereData[v].details.x));
+
+		if (hit.distance < bestTemporaryHit.distance) {
+			bestTemporaryHit = hit;
+			bestTemporaryHitIndex = v;
+		}
+
+	}
+
+	if (bestTemporaryHit.distance < 1.#INF)
+	{
+		
+		ray.energy *= float3(0.2, 0.2, 0.2);
+		ray.direction = (reflect(ray.direction, bestTemporaryHit.normal));
+		ray.origin = bestTemporaryHit.position + bestTemporaryHit.normal * 0.003f;
+
+		return SphereData[bestTemporaryHitIndex].col;
+	}
+	else {
+		ray.energy = float3(0, 0, 0);
+		ray.direction = float3(0, 0, 0);
+		ray.origin = float3(0, 0, 0);
+
+		// Sample the skybox and write it
+		float theta = acos(ray.direction.y) / -PI;
+		float phi = atan2(ray.direction.x, -ray.direction.z) / -PI * 0.5f;
+		return _SkyboxTexture.SampleLevel(sampler_SkyboxTexture, float2(phi, theta), 0).xyz;
+
+	}
+	//Sphere hitted color
+}
+
+//Without inout (the values get copied in memory)
+float3 ReflectiveRayColor(Ray incidentRay, RayHit hit)
+{
+
+	//Bounces
+
+	uint c = 0;
+
+	//Add the ray.energy * Shade(ray, hit)
+	float3 result = float3(0, 0, 0);
+	Ray tempRay = CreateRay(hit.position, (reflect(incidentRay.direction, hit.normal)));
+	RayHit tempHit = CreateRayHit();
+
+	for (int c = 0; c < 3; c++)
+	{
+		//Trace this ray witsh shade function that propogates a new ray that is fed forward
+
+		result += ClosestReflectiveTrace(tempRay, tempHit) * tempRay.energy;
+		
+		if (!any(tempRay.energy))
+			break;
+
+	}
+
+	return result;
+}
+
+
+
+void Trace(Ray ray, uint3 here)
+{
+	RayHit bestHit = CreateRayHit();
+	uint bestHitIndex;
+
+	uint count;
+	uint stride;
+	uint i;
+
+	SphereData.GetDimensions(count, stride);
+
+	for (i = 0; i < count; i++)
+	{
+		RayHit tempHit = CreateRayHit();
+
+		IntersectSphere(ray, tempHit, float4(SphereData[i].pos, SphereData[i].details.x));
+
+		if (tempHit.distance < bestHit.distance) {
+			bestHit = tempHit;
+			bestHitIndex = i;
+		}
+
+	}//s
+
+	if (bestHit.distance != 1.#INF)
+	{
+		
+		//Light coming down
+		float3 light = float3(0, 1, 0);
+
+		
+		//float intensity = 1-length(cross(bestHit.normal, light));
+		
+		float intensity = max ( dot(bestHit.normal, light) , 0 );
+
+		float3 spec = reflect(bestHit.normal,light);
+		//s
+		float3 dirFrom = normalize(CameraPos - bestHit.position);
+
+		float specD = dot(dirFrom, spec);
+
+		float ambientIntensityBro = 0.3;
+		 
+		float3 somethingelse = normalize(light - bestHit.position);
+
+		//float3 realColor = ReflectiveRayColor(ray, bestHit);
+		//SphereData[bestHitIndex].colss
+		//bestHit.normal * (intensity+0.2) +
+		Result[here.xy] = float4(bestHit.normal * (intensity + 0.2) + pow(spec.z), 1);
+
+	}
+	else {
+
+		/*IntersectGroundPlane(ray, bestHit);
+
+		if (bestHit.distance != 1.#INF)
+		{
+			bool broke = false;
+
+			if (broke)
+			{
+				Result[here.xy] = float4(0.1, 0.1, 0.1, 1);
+			}
+			else {
+				Result[here.xy] = float4(0.8, 0.8, 0.8, 1);
+			}
+			
+			//Do another ray to the light source
+			//Ray r = CreateRay(bestHit.position, normalize(light-)
+		}*/
+		{
+			// Sample the skybox and write it
+			float theta = acos(ray.direction.y) / -PI;
+			float phi = atan2(ray.direction.x, -ray.direction.z) / -PI * 0.5f;
+			
+
+			Result[here.xy] = float4(_SkyboxTexture.SampleLevel(sampler_SkyboxTexture, float2(phi, theta), 0).xyz , 1);
+		}
+
+		
+	}
+}
+
+//More info given for me here
+[numthreads(8,8,1)] 
+void CSMain (uint3 groupID : SV_GroupID,
+	// ID of thread group; range depends on Dispatch call
+	uint3 groupThreadID : SV_GroupThreadID,
+	// ID of thread in a thread group; range depends on numthreads
+	uint groupIndex : SV_GroupIndex,
+	// flattened/linearized GroupThreadID between 0 and 
+	// numthreads.x * numthreads.y * numthreadz.z - 1 
+	uint3 id : SV_DispatchThreadID) 
+{
+
+
+	// Get the dimensions of the RenderTexture
+	uint width, height;
+	Result.GetDimensions(width, height);
+
+	//id.xy -- gives values like this (x, y) 
+
+	// Transform pixel to [-1,1] range -- now shoot out rays using ScreenSpace -> World Space w/ some type of camera projection matrix that I bring in each image render call
+	float2 uv = float2((id.xy + float2(0.5f, 0.5f)) / float2(width, height) * 2.0f - 1.0f);
+	Ray ray = CreateCameraRay(uv);
+
+	Trace(ray,id);
+	//Shoot ray outward -- if hit (d
+
+	
+
+	//Result[id.xy] = float4(uv.x,uv.y,0,1);
+}

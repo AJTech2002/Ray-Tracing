@@ -1,0 +1,187 @@
+﻿// Each #kernel tells which function to compile; you can have many kernels
+#pragma kernel CSMain
+
+// Create a RenderTexture with enableRandomWrite flag and set it
+// with cs.SetTexture
+RWTexture2D<float4> Result;
+
+float4x4 _CameraToWorld;
+float4x4 _ScreenToCamera;
+float3 CameraPos;
+
+static const float PI = 3.14159265f;
+Texture2D<float4> _SkyboxTexture;
+SamplerState sampler_SkyboxTexture;
+
+int _bounces;
+
+struct SphereDat {
+	float3 pos;
+	float3 col;
+	//Radius, Shininess, -
+	float3 details;
+};
+
+RWStructuredBuffer<SphereDat> SphereData;
+
+uint length()
+{
+	uint count;
+	uint stride;
+	SphereData.GetDimensions(count, stride);
+
+	return count;
+}
+
+
+//Forward rendering --> From Light source --> Bounce -- > Hit 
+
+struct Ray {
+	float3 origin;
+	float3 direction;
+	float3 energy;
+};
+
+Ray CreateRay(float3 origin, float3 direction)
+{
+	Ray ray;
+	ray.origin = origin;
+	ray.direction = direction;
+	ray.energy = float3(1, 1, 1);
+	return ray;
+}
+
+struct RayHit
+{
+	float3 position;
+	float distance;
+	float3 normal;
+};
+
+RayHit CreateRayHit()
+{
+	RayHit hit;
+	hit.position = float3(0.0f, 0.0f, 0.0f);
+	hit.distance = 1.#INF;
+	hit.normal = float3(0.0f, 0.0f, 0.0f);
+	return hit;
+}
+
+
+Ray CreateCameraRay(float2 uv) {
+
+	float3 origin = CameraPos;
+	float3 direction = mul(_ScreenToCamera, float4(uv, 0,1)).xyz;
+	float3 realDirection = normalize( mul(_CameraToWorld, float4(direction,0)).xyz );
+
+	return CreateRay(origin, realDirection);
+
+}
+
+void IntersectSphere(Ray ray, inout RayHit bestHit, float4 sphere)
+{
+	// Calculate distance along the ray where the sphere is intersected
+	float3 d = ray.origin - sphere.xyz;
+	float p1 = -dot(ray.direction, d);
+	float p2sqr = p1 * p1 - dot(d, d) + sphere.w * sphere.w;
+	if (p2sqr < 0)
+		return;
+	float p2 = sqrt(p2sqr);
+	float t = p1 - p2 > 0 ? p1 - p2 : p1 + p2;
+	if (t > 0 && t < bestHit.distance)
+	{
+		bestHit.distance = t;
+		bestHit.position = ray.origin + t * ray.direction;
+		bestHit.normal = normalize(bestHit.position - sphere.xyz);
+	}
+}
+
+RayHit BestSphereHit(Ray ray, inout uint ID)
+{
+	RayHit bestHit = CreateRayHit();
+	uint bestHitIndex = 0;
+
+	uint count;
+	uint stride;
+	SphereData.GetDimensions(count, stride);
+
+	for (uint i = 0; i < count; i++)
+	{
+		RayHit tempHit = CreateRayHit();
+		IntersectSphere(ray, tempHit, float4(SphereData[i].pos, SphereData[i].details.x));
+
+		if (tempHit.distance < bestHit.distance)
+		{
+			bestHit = tempHit;
+			bestHitIndex = i;
+		}
+	}
+
+	ID = bestHitIndex;
+
+	return bestHit;
+}
+
+float3 Shade(inout Ray ray, RayHit hit, int sphereID)
+{
+	if (hit.distance < 1.#INF)
+	{
+		float3 specular = float3(SphereData[sphereID].details.y, SphereData[sphereID].details.y, SphereData[sphereID].details.y);
+		// Reflect the ray and multiply energy with specular reflection
+		ray.origin = hit.position + hit.normal * 0.001f;
+		ray.direction = reflect(ray.direction, hit.normal);
+		ray.energy *= specular;
+		// Return nothing
+
+		return SphereData[sphereID].col;
+	}
+	else
+	{
+		// Erase the ray's energy - the sky doesn't reflect anything
+		ray.energy = 0.0f;
+		// Sample the skybox and write it
+		float theta = acos(ray.direction.y) / -PI;
+		float phi = atan2(ray.direction.x, -ray.direction.z) / -PI * 0.5f;
+		return _SkyboxTexture.SampleLevel(sampler_SkyboxTexture, float2(phi, theta), 0).xyz;
+	}
+}
+
+[numthreads(8,8,1)]
+void CSMain (uint3 id : SV_DispatchThreadID)
+{
+	uint width, height;
+	Result.GetDimensions(width, height);
+
+	float2 uv = float2((id.xy + float2(0.5f, 0.5f)) / float2(width, height) * 2.0f - 1.0f);
+	Ray ray = CreateCameraRay(uv);
+
+
+	float3 result = float3(0, 0, 0);
+
+	
+	/*uint bestSphere = 0;
+	RayHit hit = BestSphereHit(ray, bestSphere);
+
+	if (hit.distance !=  1.#INF) {
+		Result[id.xy] = float4(SphereData[bestSphere].col, 1);
+	}
+	else {
+		float theta = acos(ray.direction.y) / -PI;
+		float phi = atan2(ray.direction.x, -ray.direction.z) / -PI * 0.5f;
+		Result[id.xy] = float4( _SkyboxTexture.SampleLevel(sampler_SkyboxTexture, float2(phi, theta), 0).xyz , 1);
+	}
+	*/
+
+	for (int i = 0; i < _bounces; i++)
+	{
+		uint bestId = 0;
+		RayHit hit = BestSphereHit(ray, bestId);
+
+		result += ray.energy * Shade(ray, hit, bestId);
+		if (!any(ray.energy))
+			break;
+	}
+
+	Result[id.xy] = float4(result,1);
+
+}
